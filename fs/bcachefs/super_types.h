@@ -4,7 +4,9 @@
 
 struct bch_sb_handle {
 	struct bch_sb		*sb;
+	struct file		*s_bdev_file;
 	struct block_device	*bdev;
+	char			*sb_name;
 	struct bio		*bio;
 	void			*holder;
 	size_t			buffer_size;
@@ -21,7 +23,7 @@ struct bch_devs_mask {
 
 struct bch_devs_list {
 	u8			nr;
-	u8			devs[BCH_BKEY_PTRS_MAX];
+	u8			data[BCH_BKEY_PTRS_MAX];
 };
 
 struct bch_member_cpu {
@@ -35,6 +37,8 @@ struct bch_member_cpu {
 	u8			durability;
 	u8			freespace_initialized;
 	u8			valid;
+	u8			btree_bitmap_shift;
+	u64			btree_allocated_bitmap;
 };
 
 #endif /* _BCACHEFS_SUPER_TYPES_H */
