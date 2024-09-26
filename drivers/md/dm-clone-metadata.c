@@ -163,7 +163,7 @@ struct dm_clone_metadata {
 /*
  * Superblock validation.
  */
-static void sb_prepare_for_write(struct dm_block_validator *v,
+static void sb_prepare_for_write(const struct dm_block_validator *v,
 				 struct dm_block *b, size_t sb_block_size)
 {
 	struct superblock_disk *sb;
@@ -177,7 +177,7 @@ static void sb_prepare_for_write(struct dm_block_validator *v,
 	sb->csum = cpu_to_le32(csum);
 }
 
-static int sb_check(struct dm_block_validator *v, struct dm_block *b,
+static int sb_check(const struct dm_block_validator *v, struct dm_block *b,
 		    size_t sb_block_size)
 {
 	struct superblock_disk *sb;
@@ -220,7 +220,7 @@ static int sb_check(struct dm_block_validator *v, struct dm_block *b,
 	return 0;
 }
 
-static struct dm_block_validator sb_validator = {
+static const struct dm_block_validator sb_validator = {
 	.name = "superblock",
 	.prepare_for_write = sb_prepare_for_write,
 	.check = sb_check
@@ -265,680 +265,759 @@ static int __superblock_all_zeroes(struct dm_block_manager *bm, bool *formatted)
 	return 0;
 }
 
-static struct dm_The number of in flight migrations that are performing
-	 * background io. eg, promotion, writeback.
-	 */
-	atomic_t nr_io_migrations;
-
-	struct bio_list deferred_bios;
-
-	struct rw_semaphore quiesce_lock;
-
-	/*
-	 * origin_blocks entries, discarded if set.
-	 */
-	dm_dblock_t discard_nr_blocks;
-	unsigned long *discard_bitset;
-	uint32_t discard_block_size; /* a power of 2 times sectors per block */
-
-	/*
-	 * Rather than reconstructing the table line for the status we just
-	 * save it and regurgitate.
-	 */
-	unsigned int nr_ctr_args;
-	const char **ctr_args;
-
-	struct dm_kcopyd_client *copier;
-	struct work_struct deferred_bio_worker;
-	struct work_struct migration_worker;
-	struct workqueue_struct *wq;
-	struct delayed_work waker;
-	struct dm_bio_prison_v2 *prison;
-
-	/*
-	 * cache_size entries, dirty if set
-	 */
-	unsigned long *dirty_bitset;
-	atomic_t nr_dirty;
-
-	unsigned int policy_nr_args;
-	struct dm_cache_policy *policy;
-
-	/*
-	 * Cache features such as write-through.
-	 */
-	struct cache_features features;
-
-	struct cache_stats stats;
-
-	bool need_tick_bio:1;
-	bool sized:1;
-	bool invalidate:1;
-	bool commit_requested:1;
-	bool loaded_mappings:1;
-	bool loaded_discards:1;
-
-	struct rw_semaphore background_work_lock;
-
-	struct batcher committer;
-	struct work_struct commit_ws;
-
-	struct dm_io_tracker tracker;
-
-	mempool_t migration_pool;
-
-	struct bio_set bs;
-};
-
-struct per_bio_data {
-	bool tick:1;
-	unsigned int req_nr:2;
-	struct dm_bio_prison_cell_v2 *cell;
-	struct dm_hook_info hook_info;
-	sector_t len;
-};
-
-struct dm_cache_migration {
-	struct continuation k;
-	struct cache *cache;
-
-	struct policy_work *op;
-	struct bio *overwrite_bio;
-	struct dm_bio_prison_cell_v2 *cell;
-
-	dm_cblock_t invalidate_cblock;
-	dm_oblock_t invalidate_oblock;
-};
-
-/*----------------------------------------------------------------*/
-
-static bool writethrough_mode(struct cache *cache)
-{
-	return cache->features.io_mode == CM_IO_WRITETHROUGH;
-}
-
-static bool writeback_mode(struct cache *cache)
-{
-	return cache->features.io_mode == CM_IO_WRITEBACK;
-}
-
-static inline bool passthrough_mode(struct cache *cache)
-{
-	return unlikely(cache->features.io_mode == CM_IO_PASSTHROUGH);
-}
-
-/*----------------------------------------------------------------*/
-
-static void wake_deferred_bio_worker(struct cache *cache)
-{
-	queue_work(cache->wq, &cache->deferred_bio_worker);
-}
-
-static void wake_migration_worker(struct cache *cache)
-{
-	if (passthrough_mode(cache))
-		return;
-
-	queue_work(cache->wq, &cache->migration_worker);
-}
-
-/*----------------------------------------------------------------*/
-
-static struct dm_bio_prison_cell_v2 *alloc_prison_cell(struct cache *cache)
-{
-	return dm_bio_prison_alloc_cell_v2(cache->prison, GFP_NOIO);
-}
-
-static void free_prison_cell(struct cache *cache, struct dm_bio_prison_cell_v2 *cell)
-{
-	dm_bio_prison_free_cell_v2(cache->prison, cell);
-}
-
-static struct dm_cache_migration *alloc_migration(struct cache *cache)
-{
-	struct dm_cache_migration *mg;
-
-	mg = mempool_alloc(&cache->migration_pool, GFP_NOIO);
-
-	memset(mg, 0, sizeof(*mg));
-
-	mg->cache = cache;
-	atomic_inc(&cache->nr_allocated_migrations);
-
-	return mg;
-}
-
-static void free_migration(struct dm_cache_migration *mg)
-{
-	struct cache *cache = mg->cache;
-
-	if (atomic_dec_and_test(&cache->nr_allocated_migrations))
-		wake_up(&cache->migration_wait);
-
-	mempool_free(mg, &cache->migration_pool);
-}
-
-/*----------------------------------------------------------------*/
-
-static inline dm_oblock_t oblock_succ(dm_oblock_t b)
-{
-	return to_oblock(from_oblock(b) + 1ull);
-}
-
-static void build_key(dm_oblock_t begin, dm_oblock_t end, struct dm_cell_key_v2 *key)
-{
-	key->virtual = 0;
-	key->dev = 0;
-	key->block_begin = from_oblock(begin);
-	key->block_end = from_oblock(end);
-}
+/*---------------------------------------------------------------------------*/
 
 /*
- * We have two lock levels.  Level 0, which is used to prevent WRITEs, and
- * level 1 which prevents *both* READs and WRITEs.
+ * Low-level metadata handling.
  */
-#define WRITE_LOCK_LEVEL 0
-#define READ_WRITE_LOCK_LEVEL 1
-
-static unsigned int lock_level(struct bio *bio)
+static inline int superblock_read_lock(struct dm_clone_metadata *cmd,
+				       struct dm_block **sblock)
 {
-	return bio_data_dir(bio) == WRITE ?
-		WRITE_LOCK_LEVEL :
-		READ_WRITE_LOCK_LEVEL;
+	return dm_bm_read_lock(cmd->bm, SUPERBLOCK_LOCATION, &sb_validator, sblock);
 }
 
-/*
- *--------------------------------------------------------------
- * Per bio data
- *--------------------------------------------------------------
- */
-
-static struct per_bio_data *get_per_bio_data(struct bio *bio)
+static inline int superblock_write_lock_zero(struct dm_clone_metadata *cmd,
+					     struct dm_block **sblock)
 {
-	struct per_bio_data *pb = dm_per_bio_data(bio, sizeof(struct per_bio_data));
-
-	BUG_ON(!pb);
-	return pb;
+	return dm_bm_write_lock_zero(cmd->bm, SUPERBLOCK_LOCATION, &sb_validator, sblock);
 }
 
-static struct per_bio_data *init_per_bio_data(struct bio *bio)
+static int __copy_sm_root(struct dm_clone_metadata *cmd)
 {
-	struct per_bio_data *pb = get_per_bio_data(bio);
+	int r;
+	size_t root_size;
 
-	pb->tick = false;
-	pb->req_nr = dm_bio_get_target_bio_nr(bio);
-	pb->cell = NULL;
-	pb->len = 0;
+	r = dm_sm_root_size(cmd->sm, &root_size);
+	if (r)
+		return r;
 
-	return pb;
+	return dm_sm_copy_root(cmd->sm, &cmd->metadata_space_map_root, root_size);
 }
 
-/*----------------------------------------------------------------*/
-
-static void defer_bio(struct cache *cache, struct bio *bio)
+/* Save dm-clone metadata in superblock */
+static void __prepare_superblock(struct dm_clone_metadata *cmd,
+				 struct superblock_disk *sb)
 {
-	spin_lock_irq(&cache->lock);
-	bio_list_add(&cache->deferred_bios, bio);
-	spin_unlock_irq(&cache->lock);
+	sb->flags = cpu_to_le32(0UL);
 
-	wake_deferred_bio_worker(cache);
+	/* FIXME: UUID is currently unused */
+	memset(sb->uuid, 0, sizeof(sb->uuid));
+
+	sb->magic = cpu_to_le64(SUPERBLOCK_MAGIC);
+	sb->version = cpu_to_le32(DM_CLONE_MAX_METADATA_VERSION);
+
+	/* Save the metadata space_map root */
+	memcpy(&sb->metadata_space_map_root, &cmd->metadata_space_map_root,
+	       sizeof(cmd->metadata_space_map_root));
+
+	sb->region_size = cpu_to_le64(cmd->region_size);
+	sb->target_size = cpu_to_le64(cmd->target_size);
+	sb->bitset_root = cpu_to_le64(cmd->bitset_root);
 }
 
-static void defer_bios(struct cache *cache, struct bio_list *bios)
+static int __open_metadata(struct dm_clone_metadata *cmd)
 {
-	spin_lock_irq(&cache->lock);
-	bio_list_merge_init(&cache->deferred_bios, bios);
-	spin_unlock_irq(&cache->lock);
+	int r;
+	struct dm_block *sblock;
+	struct superblock_disk *sb;
 
-	wake_deferred_bio_worker(cache);
-}
+	r = superblock_read_lock(cmd, &sblock);
 
-/*----------------------------------------------------------------*/
-
-static bool bio_detain_shared(struct cache *cache, dm_oblock_t oblock, struct bio *bio)
-{
-	bool r;
-	struct per_bio_data *pb;
-	struct dm_cell_key_v2 key;
-	dm_oblock_t end = to_oblock(from_oblock(oblock) + 1ULL);
-	struct dm_bio_prison_cell_v2 *cell_prealloc, *cell;
-
-	cell_prealloc = alloc_prison_cell(cache); /* FIXME: allow wait if calling from worker */
-
-	build_key(oblock, end, &key);
-	r = dm_cell_get_v2(cache->prison, &key, lock_level(bio), bio, cell_prealloc, &cell);
-	if (!r) {
-		/*
-		 * Failed to get the lock.
-		 */
-		free_prison_cell(cache, cell_prealloc);
+	if (r) {
+		DMERR("Failed to read_lock superblock");
 		return r;
 	}
 
-	if (cell != cell_prealloc)
-		free_prison_cell(cache, cell_prealloc);
+	sb = dm_block_data(sblock);
 
-	pb = get_per_bio_data(bio);
-	pb->cell = cell;
+	/* Verify that target_size and region_size haven't changed. */
+	if (cmd->region_size != le64_to_cpu(sb->region_size) ||
+	    cmd->target_size != le64_to_cpu(sb->target_size)) {
+		DMERR("Region and/or target size don't match the ones in metadata");
+		r = -EINVAL;
+		goto out_with_lock;
+	}
+
+	r = dm_tm_open_with_sm(cmd->bm, SUPERBLOCK_LOCATION,
+			       sb->metadata_space_map_root,
+			       sizeof(sb->metadata_space_map_root),
+			       &cmd->tm, &cmd->sm);
+
+	if (r) {
+		DMERR("dm_tm_open_with_sm failed");
+		goto out_with_lock;
+	}
+
+	dm_disk_bitset_init(cmd->tm, &cmd->bitset_info);
+	cmd->bitset_root = le64_to_cpu(sb->bitset_root);
+
+out_with_lock:
+	dm_bm_unlock(sblock);
 
 	return r;
 }
 
-/*----------------------------------------------------------------*/
-
-static bool is_dirty(struct cache *cache, dm_cblock_t b)
+static int __format_metadata(struct dm_clone_metadata *cmd)
 {
-	return test_bit(from_cblock(b), cache->dirty_bitset);
-}
+	int r;
+	struct dm_block *sblock;
+	struct superblock_disk *sb;
 
-static void set_dirty(struct cache *cache, dm_cblock_t cblock)
-{
-	if (!test_and_set_bit(from_cblock(cblock), cache->dirty_bitset)) {
-		atomic_inc(&cache->nr_dirty);
-		policy_set_dirty(cache->policy, cblock);
-	}
-}
-
-/*
- * These two are called when setting after migrations to force the policy
- * and dirty bitset to be in sync.
- */
-static void force_set_dirty(struct cache *cache, dm_cblock_t cblock)
-{
-	if (!test_and_set_bit(from_cblock(cblock), cache->dirty_bitset))
-		atomic_inc(&cache->nr_dirty);
-	policy_set_dirty(cache->policy, cblock);
-}
-
-static void force_clear_dirty(struct cache *cache, dm_cblock_t cblock)
-{
-	if (test_and_clear_bit(from_cblock(cblock), cache->dirty_bitset)) {
-		if (atomic_dec_return(&cache->nr_dirty) == 0)
-			dm_table_event(cache->ti->table);
+	r = dm_tm_create_with_sm(cmd->bm, SUPERBLOCK_LOCATION, &cmd->tm, &cmd->sm);
+	if (r) {
+		DMERR("Failed to create transaction manager");
+		return r;
 	}
 
-	policy_clear_dirty(cache->policy, cblock);
+	dm_disk_bitset_init(cmd->tm, &cmd->bitset_info);
+
+	r = dm_bitset_empty(&cmd->bitset_info, &cmd->bitset_root);
+	if (r) {
+		DMERR("Failed to create empty on-disk bitset");
+		goto err_with_tm;
+	}
+
+	r = dm_bitset_resize(&cmd->bitset_info, cmd->bitset_root, 0,
+			     cmd->nr_regions, false, &cmd->bitset_root);
+	if (r) {
+		DMERR("Failed to resize on-disk bitset to %lu entries", cmd->nr_regions);
+		goto err_with_tm;
+	}
+
+	/* Flush to disk all blocks, except the superblock */
+	r = dm_tm_pre_commit(cmd->tm);
+	if (r) {
+		DMERR("dm_tm_pre_commit failed");
+		goto err_with_tm;
+	}
+
+	r = __copy_sm_root(cmd);
+	if (r) {
+		DMERR("__copy_sm_root failed");
+		goto err_with_tm;
+	}
+
+	r = superblock_write_lock_zero(cmd, &sblock);
+	if (r) {
+		DMERR("Failed to write_lock superblock");
+		goto err_with_tm;
+	}
+
+	sb = dm_block_data(sblock);
+	__prepare_superblock(cmd, sb);
+	r = dm_tm_commit(cmd->tm, sblock);
+	if (r) {
+		DMERR("Failed to commit superblock");
+		goto err_with_tm;
+	}
+
+	return 0;
+
+err_with_tm:
+	dm_sm_destroy(cmd->sm);
+	dm_tm_destroy(cmd->tm);
+
+	return r;
 }
 
-/*----------------------------------------------------------------*/
-
-static bool block_size_is_power_of_two(struct cache *cache)
+static int __open_or_format_metadata(struct dm_clone_metadata *cmd, bool may_format_device)
 {
-	return cache->sectors_per_block_shift >= 0;
+	int r;
+	bool formatted = false;
+
+	r = __superblock_all_zeroes(cmd->bm, &formatted);
+	if (r)
+		return r;
+
+	if (!formatted)
+		return may_format_device ? __format_metadata(cmd) : -EPERM;
+
+	return __open_metadata(cmd);
 }
 
-static dm_block_t block_div(dm_block_t b, uint32_t n)
-{
-	do_div(b, n);
-
-	return b;
-}
-
-static dm_block_t oblocks_per_dblock(struct cache *cache)
-{
-	dm_block_t oblocks = cache->discard_block_size;
-
-	if (block_size_is_power_of_two(cache))
-		oblocks >>= cache->sectors_per_block_shift;
-	else
-		oblocks = block_div(oblocks, cache->sectors_per_block);
-
-	return oblocks;
-}
-
-static dm_dblock_t oblock_to_dblock(struct cache *cache, dm_oblock_t oblock)
-{
-	return to_dblock(block_div(from_oblock(oblock),
-				   oblocks_per_dblock(cache)));
-}
-
-static void set_discard(struct cache *cache, dm_dblock_t b)
-{
-	BUG_ON(from_dblock(b) >= from_dblock(cache->discard_nr_blocks));
-	atomic_inc(&cache->stats.discard_count);
-
-	spin_lock_irq(&cache->lock);
-	set_bit(from_dblock(b), cache->discard_bitset);
-	spin_unlock_irq(&cache->lock);
-}
-
-static void clear_discard(struct cache *cache, dm_dblock_t b)
-{
-	spin_lock_irq(&cache->lock);
-	clear_bit(from_dblock(b), cache->discard_bitset);
-	spin_unlock_irq(&cache->lock);
-}
-
-static bool is_discarded(struct cache *cache, dm_dblock_t b)
+static int __create_persistent_data_structures(struct dm_clone_metadata *cmd,
+					       bool may_format_device)
 {
 	int r;
 
-	spin_lock_irq(&cache->lock);
-	r = test_bit(from_dblock(b), cache->discard_bitset);
-	spin_unlock_irq(&cache->lock);
+	/* Create block manager */
+	cmd->bm = dm_block_manager_create(cmd->bdev,
+					 DM_CLONE_METADATA_BLOCK_SIZE << SECTOR_SHIFT,
+					 DM_CLONE_MAX_CONCURRENT_LOCKS);
+	if (IS_ERR(cmd->bm)) {
+		DMERR("Failed to create block manager");
+		return PTR_ERR(cmd->bm);
+	}
+
+	r = __open_or_format_metadata(cmd, may_format_device);
+	if (r)
+		dm_block_manager_destroy(cmd->bm);
 
 	return r;
 }
 
-static bool is_discarded_oblock(struct cache *cache, dm_oblock_t b)
+static void __destroy_persistent_data_structures(struct dm_clone_metadata *cmd)
+{
+	dm_sm_destroy(cmd->sm);
+	dm_tm_destroy(cmd->tm);
+	dm_block_manager_destroy(cmd->bm);
+}
+
+/*---------------------------------------------------------------------------*/
+
+static int __dirty_map_init(struct dirty_map *dmap, unsigned long nr_words,
+			    unsigned long nr_regions)
+{
+	dmap->changed = 0;
+
+	dmap->dirty_words = kvzalloc(bitmap_size(nr_words), GFP_KERNEL);
+	if (!dmap->dirty_words)
+		return -ENOMEM;
+
+	dmap->dirty_regions = kvzalloc(bitmap_size(nr_regions), GFP_KERNEL);
+	if (!dmap->dirty_regions) {
+		kvfree(dmap->dirty_words);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void __dirty_map_exit(struct dirty_map *dmap)
+{
+	kvfree(dmap->dirty_words);
+	kvfree(dmap->dirty_regions);
+}
+
+static int dirty_map_init(struct dm_clone_metadata *cmd)
+{
+	if (__dirty_map_init(&cmd->dmap[0], cmd->nr_words, cmd->nr_regions)) {
+		DMERR("Failed to allocate dirty bitmap");
+		return -ENOMEM;
+	}
+
+	if (__dirty_map_init(&cmd->dmap[1], cmd->nr_words, cmd->nr_regions)) {
+		DMERR("Failed to allocate dirty bitmap");
+		__dirty_map_exit(&cmd->dmap[0]);
+		return -ENOMEM;
+	}
+
+	cmd->current_dmap = &cmd->dmap[0];
+	cmd->committing_dmap = NULL;
+
+	return 0;
+}
+
+static void dirty_map_exit(struct dm_clone_metadata *cmd)
+{
+	__dirty_map_exit(&cmd->dmap[0]);
+	__dirty_map_exit(&cmd->dmap[1]);
+}
+
+static int __load_bitset_in_core(struct dm_clone_metadata *cmd)
 {
 	int r;
+	unsigned long i;
+	struct dm_bitset_cursor c;
 
-	spin_lock_irq(&cache->lock);
-	r = test_bit(from_dblock(oblock_to_dblock(cache, b)),
-		     cache->discard_bitset);
-	spin_unlock_irq(&cache->lock);
+	/* Flush bitset cache */
+	r = dm_bitset_flush(&cmd->bitset_info, cmd->bitset_root, &cmd->bitset_root);
+	if (r)
+		return r;
 
-	return r;
-}
+	r = dm_bitset_cursor_begin(&cmd->bitset_info, cmd->bitset_root, cmd->nr_regions, &c);
+	if (r)
+		return r;
 
-/*
- * -------------------------------------------------------------
- * Remapping
- *--------------------------------------------------------------
- */
-static void remap_to_origin(struct cache *cache, struct bio *bio)
-{
-	bio_set_dev(bio, cache->origin_dev->bdev);
-}
-
-static void remap_to_cache(struct cache *cache, struct bio *bio,
-			   dm_cblock_t cblock)
-{
-	sector_t bi_sector = bio->bi_iter.bi_sector;
-	sector_t block = from_cblock(cblock);
-
-	bio_set_dev(bio, cache->cache_dev->bdev);
-	if (!block_size_is_power_of_two(cache))
-		bio->bi_iter.bi_sector =
-			(block * cache->sectors_per_block) +
-			sector_div(bi_sector, cache->sectors_per_block);
-	else
-		bio->bi_iter.bi_sector =
-			(block << cache->sectors_per_block_shift) |
-			(bi_sector & (cache->sectors_per_block - 1));
-}
-
-static void check_if_tick_bio_needed(struct cache *cache, struct bio *bio)
-{
-	struct per_bio_data *pb;
-
-	spin_lock_irq(&cache->lock);
-	if (cache->need_tick_bio && !op_is_flush(bio->bi_opf) &&
-	    bio_op(bio) != REQ_OP_DISCARD) {
-		pb = get_per_bio_data(bio);
-		pb->tick = true;
-		cache->need_tick_bio = false;
-	}
-	spin_unlock_irq(&cache->lock);
-}
-
-static void remap_to_origin_clear_discard(struct cache *cache, struct bio *bio,
-					  dm_oblock_t oblock)
-{
-	// FIXME: check_if_tick_bio_needed() is called way too much through this interface
-	check_if_tick_bio_needed(cache, bio);
-	remap_to_origin(cache, bio);
-	if (bio_data_dir(bio) == WRITE)
-		clear_discard(cache, oblock_to_dblock(cache, oblock));
-}
-
-static void remap_to_cache_dirty(struct cache *cache, struct bio *bio,
-				 dm_oblock_t oblock, dm_cblock_t cblock)
-{
-	check_if_tick_bio_needed(cache, bio);
-	remap_to_cache(cache, bio, cblock);
-	if (bio_data_dir(bio) == WRITE) {
-		set_dirty(cache, cblock);
-		clear_discard(cache, oblock_to_dblock(cache, oblock));
-	}
-}
-
-static dm_oblock_t get_bio_block(struct cache *cache, struct bio *bio)
-{
-	sector_t block_nr = bio->bi_iter.bi_sector;
-
-	if (!block_size_is_power_of_two(cache))
-		(void) sector_div(block_nr, cache->sectors_per_block);
-	else
-		block_nr >>= cache->sectors_per_block_shift;
-
-	return to_oblock(block_nr);
-}
-
-static bool accountable_bio(struct cache *cache, struct bio *bio)
-{
-	return bio_op(bio) != REQ_OP_DISCARD;
-}
-
-static void accounted_begin(struct cache *cache, struct bio *bio)
-{
-	struct per_bio_data *pb;
-
-	if (accountable_bio(cache, bio)) {
-		pb = get_per_bio_data(bio);
-		pb->len = bio_sectors(bio);
-		dm_iot_io_begin(&cache->tracker, pb->len);
-	}
-}
-
-static void accounted_complete(struct cache *cache, struct bio *bio)
-{
-	struct per_bio_data *pb = get_per_bio_data(bio);
-
-	dm_iot_io_end(&cache->tracker, pb->len);
-}
-
-static void accounted_request(struct cache *cache, struct bio *bio)
-{
-	accounted_begin(cache, bio);
-	dm_submit_bio_remap(bio, NULL);
-}
-
-static void issue_op(struct bio *bio, void *context)
-{
-	struct cache *cache = context;
-
-	accounted_request(cache, bio);
-}
-
-/*
- * When running in writethrough mode we need to send writes to clean blocks
- * to both the cache and origin devices.  Clone the bio and send them in parallel.
- */
-static void remap_to_origin_and_cache(struct cache *cache, struct bio *bio,
-				      dm_oblock_t oblock, dm_cblock_t cblock)
-{
-	struct bio *origin_bio = bio_alloc_clone(cache->origin_dev->bdev, bio,
-						 GFP_NOIO, &cache->bs);
-
-	BUG_ON(!origin_bio);
-
-	bio_chain(origin_bio, bio);
-
-	if (bio_data_dir(origin_bio) == WRITE)
-		clear_discard(cache, oblock_to_dblock(cache, oblock));
-	submit_bio(origin_bio);
-
-	remap_to_cache(cache, bio, cblock);
-}
-
-/*
- *--------------------------------------------------------------
- * Failure modes
- *--------------------------------------------------------------
- */
-static enum cache_metadata_mode get_cache_mode(struct cache *cache)
-{
-	return cache->features.mode;
-}
-
-static const char *cache_device_name(struct cache *cache)
-{
-	return dm_table_device_name(cache->ti->table);
-}
-
-static void notify_mode_switch(struct cache *cache, enum cache_metadata_mode mode)
-{
-	static const char *descs[] = {
-		"write",
-		"read-only",
-		"fail"
-	};
-
-	dm_table_event(cache->ti->table);
-	DMINFO("%s: switching cache to %s mode",
-	       cache_device_name(cache), descs[(int)mode]);
-}
-
-static void set_cache_mode(struct cache *cache, enum cache_metadata_mode new_mode)
-{
-	bool needs_check;
-	enum cache_metadata_mode old_mode = get_cache_mode(cache);
-
-	if (dm_cache_metadata_needs_check(cache->cmd, &needs_check)) {
-		DMERR("%s: unable to read needs_check flag, setting failure mode.",
-		      cache_device_name(cache));
-		new_mode = CM_FAIL;
-	}
-
-	if (new_mode == CM_WRITE && needs_check) {
-		DMERR("%s: unable to switch cache to write mode until repaired.",
-		      cache_device_name(cache));
-		if (old_mode != new_mode)
-			new_mode = old_mode;
+	for (i = 0; ; i++) {
+		if (dm_bitset_cursor_get_value(&c))
+			__set_bit(i, cmd->region_map);
 		else
-			new_mode = CM_READ_ONLY;
+			__clear_bit(i, cmd->region_map);
+
+		if (i >= (cmd->nr_regions - 1))
+			break;
+
+		r = dm_bitset_cursor_next(&c);
+
+		if (r)
+			break;
 	}
 
-	/* Never move out of fail mode */
-	if (old_mode == CM_FAIL)
-		new_mode = CM_FAIL;
+	dm_bitset_cursor_end(&c);
 
-	switch (new_mode) {
-	case CM_FAIL:
-	case CM_READ_ONLY:
-		dm_cache_metadata_set_read_only(cache->cmd);
-		break;
+	return r;
+}
 
-	case CM_WRITE:
-		dm_cache_metadata_set_read_write(cache->cmd);
-		break;
+struct dm_clone_metadata *dm_clone_metadata_open(struct block_device *bdev,
+						 sector_t target_size,
+						 sector_t region_size)
+{
+	int r;
+	struct dm_clone_metadata *cmd;
+
+	cmd = kzalloc(sizeof(*cmd), GFP_KERNEL);
+	if (!cmd) {
+		DMERR("Failed to allocate memory for dm-clone metadata");
+		return ERR_PTR(-ENOMEM);
 	}
 
-	cache->features.mode = new_mode;
+	cmd->bdev = bdev;
+	cmd->target_size = target_size;
+	cmd->region_size = region_size;
+	cmd->nr_regions = dm_sector_div_up(cmd->target_size, cmd->region_size);
+	cmd->nr_words = BITS_TO_LONGS(cmd->nr_regions);
 
-	if (new_mode != old_mode)
-		notify_mode_switch(cache, new_mode);
-}
+	init_rwsem(&cmd->lock);
+	spin_lock_init(&cmd->bitmap_lock);
+	cmd->read_only = 0;
+	cmd->fail_io = false;
+	cmd->hydration_done = false;
 
-static void abort_transaction(struct cache *cache)
-{
-	const char *dev_name = cache_device_name(cache);
-
-	if (get_cache_mode(cache) >= CM_READ_ONLY)
-		return;
-
-	DMERR_LIMIT("%s: aborting current metadata transaction", dev_name);
-	if (dm_cache_metadata_abort(cache->cmd)) {
-		DMERR("%s: failed to abort metadata transaction", dev_name);
-		set_cache_mode(cache, CM_FAIL);
+	cmd->region_map = kvmalloc(bitmap_size(cmd->nr_regions), GFP_KERNEL);
+	if (!cmd->region_map) {
+		DMERR("Failed to allocate memory for region bitmap");
+		r = -ENOMEM;
+		goto out_with_md;
 	}
 
-	if (dm_cache_metadata_set_needs_check(cache->cmd)) {
-		DMERR("%s: failed to set 'needs_check' flag in metadata", dev_name);
-		set_cache_mode(cache, CM_FAIL);
+	r = __create_persistent_data_structures(cmd, true);
+	if (r)
+		goto out_with_region_map;
+
+	r = __load_bitset_in_core(cmd);
+	if (r) {
+		DMERR("Failed to load on-disk region map");
+		goto out_with_pds;
 	}
+
+	r = dirty_map_init(cmd);
+	if (r)
+		goto out_with_pds;
+
+	if (bitmap_full(cmd->region_map, cmd->nr_regions))
+		cmd->hydration_done = true;
+
+	return cmd;
+
+out_with_pds:
+	__destroy_persistent_data_structures(cmd);
+
+out_with_region_map:
+	kvfree(cmd->region_map);
+
+out_with_md:
+	kfree(cmd);
+
+	return ERR_PTR(r);
 }
 
-static void metadata_operation_failed(struct cache *cache, const char *op, int r)
+void dm_clone_metadata_close(struct dm_clone_metadata *cmd)
 {
-	DMERR_LIMIT("%s: metadata operation '%s' failed: error = %d",
-		    cache_device_name(cache), op, r);
-	abort_transaction(cache);
-	set_cache_mode(cache, CM_READ_ONLY);
+	if (!cmd->fail_io)
+		__destroy_persistent_data_structures(cmd);
+
+	dirty_map_exit(cmd);
+	kvfree(cmd->region_map);
+	kfree(cmd);
 }
 
-/*----------------------------------------------------------------*/
-
-static void load_stats(struct cache *cache)
+bool dm_clone_is_hydration_done(struct dm_clone_metadata *cmd)
 {
-	struct dm_cache_statistics stats;
-
-	dm_cache_metadata_get_stats(cache->cmd, &stats);
-	atomic_set(&cache->stats.read_hit, stats.read_hits);
-	atomic_set(&cache->stats.read_miss, stats.read_misses);
-	atomic_set(&cache->stats.write_hit, stats.write_hits);
-	atomic_set(&cache->stats.write_miss, stats.write_misses);
+	return cmd->hydration_done;
 }
 
-static void save_stats(struct cache *cache)
+bool dm_clone_is_region_hydrated(struct dm_clone_metadata *cmd, unsigned long region_nr)
 {
-	struct dm_cache_statistics stats;
-
-	if (get_cache_mode(cache) >= CM_READ_ONLY)
-		return;
-
-	stats.read_hits = atomic_read(&cache->stats.read_hit);
-	stats.read_misses = atomic_read(&cache->stats.read_miss);
-	stats.write_hits = atomic_read(&cache->stats.write_hit);
-	stats.write_misses = atomic_read(&cache->stats.write_miss);
-
-	dm_cache_metadata_set_stats(cache->cmd, &stats);
+	return dm_clone_is_hydration_done(cmd) || test_bit(region_nr, cmd->region_map);
 }
 
-static void update_stats(struct cache_stats *stats, enum policy_operation op)
+bool dm_clone_is_range_hydrated(struct dm_clone_metadata *cmd,
+				unsigned long start, unsigned long nr_regions)
 {
-	switch (op) {
-	case POLICY_PROMOTE:
-		atomic_inc(&stats->promotion);
-		break;
+	unsigned long bit;
 
-	case POLICY_DEMOTE:
-		atomic_inc(&stats->demotion);
-		break;
+	if (dm_clone_is_hydration_done(cmd))
+		return true;
 
-	case POLICY_WRITEBACK:
-		atomic_inc(&stats->writeback);
-		break;
+	bit = find_next_zero_bit(cmd->region_map, cmd->nr_regions, start);
+
+	return (bit >= (start + nr_regions));
+}
+
+unsigned int dm_clone_nr_of_hydrated_regions(struct dm_clone_metadata *cmd)
+{
+	return bitmap_weight(cmd->region_map, cmd->nr_regions);
+}
+
+unsigned long dm_clone_find_next_unhydrated_region(struct dm_clone_metadata *cmd,
+						   unsigned long start)
+{
+	return find_next_zero_bit(cmd->region_map, cmd->nr_regions, start);
+}
+
+static int __update_metadata_word(struct dm_clone_metadata *cmd,
+				  unsigned long *dirty_regions,
+				  unsigned long word)
+{
+	int r;
+	unsigned long index = word * BITS_PER_LONG;
+	unsigned long max_index = min(cmd->nr_regions, (word + 1) * BITS_PER_LONG);
+
+	while (index < max_index) {
+		if (test_bit(index, dirty_regions)) {
+			r = dm_bitset_set_bit(&cmd->bitset_info, cmd->bitset_root,
+					      index, &cmd->bitset_root);
+			if (r) {
+				DMERR("dm_bitset_set_bit failed");
+				return r;
+			}
+			__clear_bit(index, dirty_regions);
+		}
+		index++;
 	}
+
+	return 0;
+}
+
+static int __metadata_commit(struct dm_clone_metadata *cmd)
+{
+	int r;
+	struct dm_block *sblock;
+	struct superblock_disk *sb;
+
+	/* Flush bitset cache */
+	r = dm_bitset_flush(&cmd->bitset_info, cmd->bitset_root, &cmd->bitset_root);
+	if (r) {
+		DMERR("dm_bitset_flush failed");
+		return r;
+	}
+
+	/* Flush to disk all blocks, except the superblock */
+	r = dm_tm_pre_commit(cmd->tm);
+	if (r) {
+		DMERR("dm_tm_pre_commit failed");
+		return r;
+	}
+
+	/* Save the space map root in cmd->metadata_space_map_root */
+	r = __copy_sm_root(cmd);
+	if (r) {
+		DMERR("__copy_sm_root failed");
+		return r;
+	}
+
+	/* Lock the superblock */
+	r = superblock_write_lock_zero(cmd, &sblock);
+	if (r) {
+		DMERR("Failed to write_lock superblock");
+		return r;
+	}
+
+	/* Save the metadata in superblock */
+	sb = dm_block_data(sblock);
+	__prepare_superblock(cmd, sb);
+
+	/* Unlock superblock and commit it to disk */
+	r = dm_tm_commit(cmd->tm, sblock);
+	if (r) {
+		DMERR("Failed to commit superblock");
+		return r;
+	}
+
+	/*
+	 * FIXME: Find a more efficient way to check if the hydration is done.
+	 */
+	if (bitmap_full(cmd->region_map, cmd->nr_regions))
+		cmd->hydration_done = true;
+
+	return 0;
+}
+
+static int __flush_dmap(struct dm_clone_metadata *cmd, struct dirty_map *dmap)
+{
+	int r;
+	unsigned long word;
+
+	word = 0;
+	do {
+		word = find_next_bit(dmap->dirty_words, cmd->nr_words, word);
+
+		if (word == cmd->nr_words)
+			break;
+
+		r = __update_metadata_word(cmd, dmap->dirty_regions, word);
+
+		if (r)
+			return r;
+
+		__clear_bit(word, dmap->dirty_words);
+		word++;
+	} while (word < cmd->nr_words);
+
+	r = __metadata_commit(cmd);
+
+	if (r)
+		return r;
+
+	/* Update the changed flag */
+	spin_lock_irq(&cmd->bitmap_lock);
+	dmap->changed = 0;
+	spin_unlock_irq(&cmd->bitmap_lock);
+
+	return 0;
+}
+
+int dm_clone_metadata_pre_commit(struct dm_clone_metadata *cmd)
+{
+	int r = 0;
+	struct dirty_map *dmap, *next_dmap;
+
+	down_write(&cmd->lock);
+
+	if (cmd->fail_io || dm_bm_is_read_only(cmd->bm)) {
+		r = -EPERM;
+		goto out;
+	}
+
+	/* Get current dirty bitmap */
+	dmap = cmd->current_dmap;
+
+	/* Get next dirty bitmap */
+	next_dmap = (dmap == &cmd->dmap[0]) ? &cmd->dmap[1] : &cmd->dmap[0];
+
+	/*
+	 * The last commit failed, so we don't have a clean dirty-bitmap to
+	 * use.
+	 */
+	if (WARN_ON(next_dmap->changed || cmd->committing_dmap)) {
+		r = -EINVAL;
+		goto out;
+	}
+
+	/* Swap dirty bitmaps */
+	spin_lock_irq(&cmd->bitmap_lock);
+	cmd->current_dmap = next_dmap;
+	spin_unlock_irq(&cmd->bitmap_lock);
+
+	/* Set old dirty bitmap as currently committing */
+	cmd->committing_dmap = dmap;
+out:
+	up_write(&cmd->lock);
+
+	return r;
+}
+
+int dm_clone_metadata_commit(struct dm_clone_metadata *cmd)
+{
+	int r = -EPERM;
+
+	down_write(&cmd->lock);
+
+	if (cmd->fail_io || dm_bm_is_read_only(cmd->bm))
+		goto out;
+
+	if (WARN_ON(!cmd->committing_dmap)) {
+		r = -EINVAL;
+		goto out;
+	}
+
+	r = __flush_dmap(cmd, cmd->committing_dmap);
+	if (!r) {
+		/* Clear committing dmap */
+		cmd->committing_dmap = NULL;
+	}
+out:
+	up_write(&cmd->lock);
+
+	return r;
+}
+
+int dm_clone_set_region_hydrated(struct dm_clone_metadata *cmd, unsigned long region_nr)
+{
+	int r = 0;
+	struct dirty_map *dmap;
+	unsigned long word, flags;
+
+	if (unlikely(region_nr >= cmd->nr_regions)) {
+		DMERR("Region %lu out of range (total number of regions %lu)",
+		      region_nr, cmd->nr_regions);
+		return -ERANGE;
+	}
+
+	word = region_nr / BITS_PER_LONG;
+
+	spin_lock_irqsave(&cmd->bitmap_lock, flags);
+
+	if (cmd->read_only) {
+		r = -EPERM;
+		goto out;
+	}
+
+	dmap = cmd->current_dmap;
+
+	__set_bit(word, dmap->dirty_words);
+	__set_bit(region_nr, dmap->dirty_regions);
+	__set_bit(region_nr, cmd->region_map);
+	dmap->changed = 1;
+
+out:
+	spin_unlock_irqrestore(&cmd->bitmap_lock, flags);
+
+	return r;
+}
+
+int dm_clone_cond_set_range(struct dm_clone_metadata *cmd, unsigned long start,
+			    unsigned long nr_regions)
+{
+	int r = 0;
+	struct dirty_map *dmap;
+	unsigned long word, region_nr;
+
+	if (unlikely(start >= cmd->nr_regions || (start + nr_regions) < start ||
+		     (start + nr_regions) > cmd->nr_regions)) {
+		DMERR("Invalid region range: start %lu, nr_regions %lu (total number of regions %lu)",
+		      start, nr_regions, cmd->nr_regions);
+		return -ERANGE;
+	}
+
+	spin_lock_irq(&cmd->bitmap_lock);
+
+	if (cmd->read_only) {
+		r = -EPERM;
+		goto out;
+	}
+
+	dmap = cmd->current_dmap;
+	for (region_nr = start; region_nr < (start + nr_regions); region_nr++) {
+		if (!test_bit(region_nr, cmd->region_map)) {
+			word = region_nr / BITS_PER_LONG;
+			__set_bit(word, dmap->dirty_words);
+			__set_bit(region_nr, dmap->dirty_regions);
+			__set_bit(region_nr, cmd->region_map);
+			dmap->changed = 1;
+		}
+	}
+out:
+	spin_unlock_irq(&cmd->bitmap_lock);
+
+	return r;
 }
 
 /*
- *---------------------------------------------------------------------
- * Migration processing
+ * WARNING: This must not be called concurrently with either
+ * dm_clone_set_region_hydrated() or dm_clone_cond_set_range(), as it changes
+ * cmd->region_map without taking the cmd->bitmap_lock spinlock. The only
+ * exception is after setting the metadata to read-only mode, using
+ * dm_clone_metadata_set_read_only().
  *
- * Migration covers moving data from the origin device to the cache, or
- * vice versa.
- *---------------------------------------------------------------------
+ * We don't take the spinlock because __load_bitset_in_core() does I/O, so it
+ * may block.
  */
-static void inc_io_migrations(struct cache *cache)
+int dm_clone_reload_in_core_bitset(struct dm_clone_metadata *cmd)
 {
-	atomic_inc(&cache->nr_io_migrations);
+	int r = -EINVAL;
+
+	down_write(&cmd->lock);
+
+	if (cmd->fail_io)
+		goto out;
+
+	r = __load_bitset_in_core(cmd);
+out:
+	up_write(&cmd->lock);
+
+	return r;
 }
 
-static void dec_io_migrations(struct cache *cache)
+bool dm_clone_changed_this_transaction(struct dm_clone_metadata *cmd)
 {
-	atomic_dec(&cache->nr_io_migrations);
+	bool r;
+	unsigned long flags;
+
+	spin_lock_irqsave(&cmd->bitmap_lock, flags);
+	r = cmd->dmap[0].changed || cmd->dmap[1].changed;
+	spin_unlock_irqrestore(&cmd->bitmap_lock, flags);
+
+	return r;
 }
 
-static bool discard_or_flush(struct bio *bio)
+int dm_clone_metadata_abort(struct dm_clone_metadata *cmd)
 {
-	return bio_op(bio) == REQ_OP_DISCARD || op_is_flush(bio->bi_opf);
+	int r = -EPERM;
+
+	down_write(&cmd->lock);
+
+	if (cmd->fail_io || dm_bm_is_read_only(cmd->bm))
+		goto out;
+
+	__destroy_persistent_data_structures(cmd);
+
+	r = __create_persistent_data_structures(cmd, false);
+	if (r) {
+		/* If something went wrong we can neither write nor read the metadata */
+		cmd->fail_io = true;
+	}
+out:
+	up_write(&cmd->lock);
+
+	return r;
 }
 
-static void calc_discard_block_range(struct cache *cache, struct bio *bio,
-				     dm_dblock_t *b, dm_dblock_t *e)
+void dm_clone_metadata_set_read_only(struct dm_clone_metadata *cmd)
 {
-	sector_t sb = bio->bi_iter.bi_sector;
-	sector_t se = bio_end_sector(bio);
+	down_write(&cmd->lock);
 
-	*b = to_dblock(dm_sector_div_up(sb, cache->discard_block_size));
+	spin_lock_irq(&cmd->bitmap_lock);
+	cmd->read_only = 1;
+	spin_unlock_irq(&cmd->bitmap_lock);
 
-	if (se - sb < cache->discard_block_size)
-		*e = *b;
-	else
-		*e = to_dblock(block_div(se, cache->discard_block_size));
+	if (!cmd->fail_io)
+		dm_bm_set_read_only(cmd->bm);
+
+	up_write(&cmd->lock);
 }
 
-/*------------------------------------------------------------
+void dm_clone_metadata_set_read_write(struct dm_clone_metadata *cmd)
+{
+	down_write(&cmd->lock);
+
+	spin_lock_irq(&cmd->bitmap_lock);
+	cmd->read_only = 0;
+	spin_unlock_irq(&cmd->bitmap_lock);
+
+	if (!cmd->fail_io)
+		dm_bm_set_read_write(cmd->bm);
+
+	up_write(&cmd->lock);
+}
+
+int dm_clone_get_free_metadata_block_count(struct dm_clone_metadata *cmd,
+					   dm_block_t *result)
+{
+	int r = -EINVAL;
+
+	down_read(&cmd->lock);
+
+	if (!cmd->fail_io)
+		r = dm_sm_get_nr_free(cmd->sm, result);
+
+	up_read(&cmd->lock);
+
+	return r;
+}
+
+int dm_clone_get_metadata_dev_size(struct dm_clone_metadata *cmd,
+				   dm_block_t *result)
+{
+	int r = -EINVAL;
+
+	down_read(&cmd->lock);
+
+	if (!cmd->fail_io)
+		r = dm_sm_get_nr_blocks(cmd->sm, result);
+
+	up_read(&cmd->lock);
+
+	return r;
+}
